@@ -11,16 +11,11 @@ from __future__ import print_function
 import argparse
 import os
 import sys
-import urllib
 
-import matplotlib.pyplot as plt
 from moviepy.editor import VideoFileClip
 import numpy as np
 import scipy.misc
-import skimage.color
-import tqdm
-
-import vggnet
+from tqdm import tqdm
 
 
 def crop_center(im):
@@ -41,147 +36,140 @@ def crop_center(im):
         return im[int((h-w)/2):int((h-w)/2)+w,0:w,:]
 
 
-def preprocess_image(im):
+def extract_features(input_dir, output_dir, model_type='inceptionv3', batch_size=32):
     """
-    Preprocesses an image for a VGG model.
+    Extracts features from a CNN trained on ImageNet classification from all
+    videos in a directory.
 
     Args:
-        im (numpy.ndarray): Input RGB image to preprocess.
-    Returns:
-        numpy.ndarray, the preprocessed image.
-    """
-
-    # Resize if needed
-    if im.shape[0:1] != vggnet.IMAGE_SIZE:
-        im = scipy.misc.imresize(im, vggnet.IMAGE_SIZE)
-
-    # Mean-center image
-    out = np.empty((3,)+vggnet.IMAGE_SIZE)
-    out[2,:,:] = im[:,:,0]-vggnet.R_MEAN
-    out[1,:,:] = im[:,:,1]-vggnet.G_MEAN
-    out[0,:,:] = im[:,:,2]-vggnet.B_MEAN
-
-    return out
-
-
-def process_directory(input_dir, output_dir, model, compute_motion=False, batch_size=32):
-    """
-    Extracts CNN features from all videos in a directory.
-
-    Args:
-        input_dir (str): Input directory to extract from.
+        input_dir (str): Input directory of videos to extract from.
         output_dir (str): Directory where features should be stored.
-        model (keras.model): VGG model to extract features with.
-        compute_motion (bool): Whether or not motion features should be
-            extracted as well.
+        model_type (str): Model type to use.
+        batch_size (int): Batch size to use when processing.
     """
 
-    # Validate args
+    input_dir = os.path.expanduser(input_dir)
+    output_dir = os.path.expanduser(output_dir)
 
     if not os.path.isdir(input_dir):
-        raise RuntimeError("Input directory '{}' not found!".format(input_dir))
+        sys.stderr.write("Input directory '%s' does not exist!\n" % input_dir)
+        sys.exit(1)
 
-    if not os.path.exists(output_dir):
-        os.makedirs(output_dir)
-    elif os.path.isfile(output_dir):
-        raise RuntimeError("Output directory '{}' is a file!".format(output_dir))
 
-    filepaths = [
-        os.path.join(input_dir, x)
-        for x in os.listdir(input_dir)
-            if os.path.isfile( os.path.join(input_dir, x) )
-    ]
+    # Load desired ImageNet model
+    
+    # Note: import Keras only when needed so we don't waste time revving up
+    #       Theano/TensorFlow needlessly in case of an error
 
-    for filepath in filepaths:
+    model = None
+    input_shape = (224, 224)
 
+    if model_type.lower() == 'inceptionv3':
+        from keras.applications import InceptionV3
+        model = InceptionV3(include_top=True, weights='imagenet')
+    elif model_type.lower() == 'xception':
+        from keras.applications import Xception
+        model = Xception(include_top=True, weights='imagenet')
+    elif model_type.lower() == 'resnet50':
+        from keras.applications import ResNet50
+        model = ResNet50(include_top=True, weights='imagenet')
+    elif model_type.lower() == 'vgg16':
+        from keras.applications import VGG16
+        model = VGG16(include_top=True, weights='imagenet')
+    elif model_type.lower() == 'vgg19':
+        from keras.applications import VGG19
+        model = VGG19(include_top=True, weights='imagenet')
+    else:
+        sys.stderr.write("'%s' is not a valid ImageNet model.\n" % model_type)
+        sys.exit(1)
+
+    if model_type.lower() == 'inceptionv3' or model_type.lower() == 'xception':
+        shape = (299, 299)
+
+    # Get outputs of model from layer just before softmax predictions
+
+    from keras.models import Model
+    model = Model(model.inputs, output=model.layers[-2].output)
+
+
+    # Create output directories
+
+    visual_dir = os.path.join(output_dir, 'visual') # RGB features
+    #motion_dir = os.path.join(output_dir, 'motion') # Spatiotemporal features
+    #opflow_dir = os.path.join(output_dir, 'opflow') # Optical flow features
+
+    for directory in [visual_dir]:#, motion_dir, opflow_dir]:
+        if not os.path.exists(directory):
+            os.makedirs(directory)
+
+
+    # Find all videos that need to have features extracted
+
+    def is_video(x):
+        return x.endswith('.mp4') or x.endswith('.avi') or x.endswith('.mov')
+
+    vis_existing = [x.split('.')[0] for x in os.listdir(visual_dir)]
+    #mot_existing = [os.path.splitext(x)[0] for x in os.listdir(motion_dir)]
+    #flo_existing = [os.path.splitext(x)[0] for x in os.listdir(opflow_dir)]
+
+    video_filenames = [x for x in sorted(os.listdir(input_dir))
+                       if is_video(x) and os.path.splitext(x)[0] not in vis_existing]
+
+
+    # Go through each video and extract features
+
+    from keras.applications.imagenet_utils import preprocess_input
+
+    for video_filename in tqdm(video_filenames):
+
+        # Open video clip for reading
         try:
-            clip = VideoFileClip(filepath)
+            clip = VideoFileClip( os.path.join(input_dir, video_filename) )
         except Exception as e:
-            print("Unable to read {}. Skipping...")
-            print("Exception:", e)
+            sys.stderr.write("Unable to read '%s'. Skipping...\n" % video_filename)
+            sys.stderr.write("Exception: {}\n".format(e))
             continue
 
-        filename = os.path.split(filepath)[-1]
+        # Sample frames at 1fps
+        fps = int( np.round(clip.fps) )
+        frames = [scipy.misc.imresize(crop_center(x.astype(np.float32)), shape)
+                  for idx, x in enumerate(clip.iter_frames()) if idx % fps == fps//2]
 
-        # Estimate number of frames
-        num_frames = int(clip.fps*clip.duration)
 
-        visual_frames = np.empty((batch_size,3)+vggnet.IMAGE_SIZE)
-        motion_frames = np.empty((batch_size,3)+vggnet.IMAGE_SIZE)
+        n_frames = len(frames)
 
-        visual_features = np.empty((num_frames, 4096))
-        motion_features = np.empty((num_frames, 4096))
+        frames_arr = np.empty((n_frames,)+shape+(3,), dtype=np.float32)
+        for idx, frame in enumerate(frames):
+            frames_arr[idx,:,:,:] = frame
 
-        message = "\rProcessing {name} ({{:{frames}d}}/{{:{frames}d}})".format(
-                name=filename, frames=len(str(num_frames)))
+        frames_arr = preprocess_input(frames_arr)
 
-        frame_idx = 0
-        feat_idx = 0
-        actual_frames = 0
+        features = model.predict(frames_arr, batch_size=batch_size)
 
-        # Temp matrix to hold motion
-        motion = np.zeros((3,)+vggnet.IMAGE_SIZE)
+        name, _ = os.path.splitext(video_filename)
+        feat_filepath = os.path.join(visual_dir, name+'.npy')
 
-        sys.stdout.write(message.format(0, num_frames))
-        sys.stdout.flush()
-
-        for frame in clip.iter_frames():
-
-            cropped = scipy.misc.imresize(crop_center(frame), vggnet.IMAGE_SIZE)
-
-            motion[2,:,:] = motion[1,:,:]
-            motion[1,:,:] = motion[0,:,:]
-            motion[0,:,:] = 255*skimage.color.rgb2gray(cropped)
-
-            motion_frames[frame_idx,:,:,:] = preprocess_image(motion)
-            visual_frames[frame_idx,:,:,:] = preprocess_image(cropped)
-
-            frame_idx += 1
-            actual_frames += 1
-
-            if frame_idx == batch_size:
-                vis_feat = model.predict( visual_frames, batch_size=batch_size )
-                mot_feat = model.predict( motion_frames, batch_size=batch_size )
-
-                visual_features[feat_idx:feat_idx+batch_size,:] = vis_feat
-                motion_features[feat_idx:feat_idx+batch_size,:] = mot_feat
-
-                frame_idx = 0
-                feat_idx += batch_size
-
-                sys.stdout.write(message.format(feat_idx, num_frames))
-                sys.stdout.flush()
-
-        sys.stdout.write(message.format(num_frames, num_frames))
-        sys.stdout.write('\n')
-        sys.stdout.flush()
-
-        np.save( os.path.join(output_dir, filename+'.visual'), visual_features )
-        np.save( os.path.join(output_dir, filename+'.motion'), motion_features )
+        with open(feat_filepath, 'wb') as f:
+            np.save(f, features)
 
 
 if __name__ == '__main__':
 
-    parser = argparse.ArgumentParser(
-            description = ""
-    )
+    parser = argparse.ArgumentParser("Extract ImageNet features from videos.")
 
-    parser.add_argument('data',
-            help="Directory of videos to process.")
-    parser.add_argument('-o', '--output', default='output',
-            help="Directory where extracted features should be stored.")
+    parser.add_argument('-i', '--input', type=str, required=True,
+                        help="Directory of videos to process.")
+    parser.add_argument('-o', '--output', type=str, required=True,
+                        help="Directory where extracted features should be stored.")
 
+    parser.add_argument('-m', '--model', default='inceptionv3', type=str,
+                        help="ImageNet model to use.")
     parser.add_argument('-b', '--batch_size', default=32, type=int,
-            help="Number of frames to be processed each batch.")
-    parser.add_argument('--weights', default='vgg19_weights.h5',
-            help="Pretrained weights file for VGG-19. If file doesn't exist, "
-                 "the weights will be downloaded instead.")
+                        help="Number of frames to be processed each batch.")
 
     args = parser.parse_args()
 
-    model = vggnet.VGG_19(args.weights)
+    extract_features(input_dir=args.input, output_dir=args.output,
+                     model_type=args.model, batch_size=args.batch_size)
 
-    print()
-    process_directory(args.data, args.output, model, batch_size=args.batch_size)
-    print("\nFinished!\n")
 
